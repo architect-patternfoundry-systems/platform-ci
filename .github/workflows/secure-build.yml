@@ -444,7 +444,8 @@ jobs:
 
           echo "Running import check in: $FULL_IMAGE"
           # Pass import expression via stdin to avoid shell injection
-          printf '%s' "$RUNTIME_IMPORT_EXPR" | docker run --rm -i "$FULL_IMAGE" python -c "$(cat)"
+          # Override entrypoint in case the image defines one (e.g. streamlit run)
+          printf '%s' "$RUNTIME_IMPORT_EXPR" | docker run --rm -i --entrypoint python "$FULL_IMAGE" -c "$(cat)"
           echo "PASS: runtime import validation succeeded"
 
       # ─── OCI provenance verification ──────────────────────────────────────

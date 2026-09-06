@@ -655,7 +655,8 @@ jobs:
           fi
 
           # Update the image using yq (structured YAML mutation, not sed)
-          yq eval -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST_PATH"
+          # Use path-based assignment: select the image field of the matching container
+          yq eval -i "(.spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image) = \"${IMAGE_REF}\"" "$MANIFEST_PATH"
 
           # ─── Post-mutation verification ──────────────────────────────────
 

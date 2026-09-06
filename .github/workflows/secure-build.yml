@@ -55,14 +55,13 @@ on:
         required: false
       INTERNAL_PYPI_URL:
         required: true
-
-outputs:
-  image_digest:
-    value: ${{ jobs.build-and-verify.outputs.image_digest }}
-  immutable_tag:
-    value: ${{ jobs.build-and-verify.outputs.immutable_tag }}
-  logical_image_ref:
-    value: ${{ jobs.build-and-verify.outputs.logical_image_ref }}
+    outputs:
+      image_digest:
+        value: ${{ jobs.build-and-verify.outputs.image_digest }}
+      immutable_tag:
+        value: ${{ jobs.build-and-verify.outputs.immutable_tag }}
+      logical_image_ref:
+        value: ${{ jobs.build-and-verify.outputs.logical_image_ref }}
 
 jobs:
   build-and-verify:

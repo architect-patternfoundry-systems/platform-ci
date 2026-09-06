@@ -636,7 +636,7 @@ jobs:
 
           # Snapshot all container images before mutation
           BEFORE_COUNT=$(yq eval ".spec.template.spec.containers | length" "$MANIFEST_PATH")
-          BEFORE_IMAGES=$(yq -o=json eval ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+          BEFORE_IMAGES=$(yq eval ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
 
           # Verify the target container exists and capture its current image
           CURRENT_IMAGE=$(yq eval ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
@@ -698,9 +698,9 @@ jobs:
           fi
 
           # 5. No other container images changed
-          AFTER_IMAGES=$(yq -o=json eval ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+          AFTER_IMAGES=$(yq eval ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
           # Compare all images except the target container
-          OTHER_BEFORE=$(yq -o=json eval "[.spec.template.spec.containers[] | select(.name != \"${CONTAINER_NAME}\") | .image]" "$MANIFEST_PATH")
+          OTHER_BEFORE=$(yq eval "[.spec.template.spec.containers[] | select(.name != \"${CONTAINER_NAME}\") | .image]" "$MANIFEST_PATH")
           # We already verified the target changed correctly; just verify count consistency
           OTHER_COUNT=$(echo "$OTHER_BEFORE" | jq length)
           if [ "$OTHER_COUNT" -ne $((BEFORE_COUNT - 1)) ]; then

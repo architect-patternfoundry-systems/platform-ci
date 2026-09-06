@@ -234,6 +234,10 @@ jobs:
 
       - name: Build and Push Docker Image
         id: build-push
+        env:
+          BUILD_ARGS_INPUT: ${{ inputs.build_args }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile }}
+          BUILD_CONTEXT: ${{ inputs.context }}
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ inputs.image_name }}"
@@ -247,20 +251,26 @@ jobs:
           TRUSTED_HOST=$(echo "${{ secrets.INTERNAL_PYPI_URL }}" | awk -F/ '{print $3}' | cut -d: -f1)
           CACHE_REF="${LOCAL_REG}/${IMAGE_NAME}:cache"
 
-          # Parse additional build args
+          # Parse additional build args from env var (avoids shell injection)
           EXTRA_BUILD_ARGS=""
-          if [ -n "${{ inputs.build_args }}" ]; then
+          if [ -n "$BUILD_ARGS_INPUT" ]; then
             while IFS= read -r line; do
               [ -z "$line" ] && continue
-              EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS --build-arg $line"
-            done <<< "${{ inputs.build_args }}"
+              # Validate: only key=value pairs, no shell metacharacters
+              if echo "$line" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*='; then
+                EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS --build-arg $line"
+              else
+                echo "::error::Invalid build arg (must be KEY=value): $line"
+                exit 1
+              fi
+            done <<< "$BUILD_ARGS_INPUT"
           fi
 
           echo "Building and pushing: $PUSH_TAG"
 
           docker buildx build \
             --builder ${{ steps.buildx.outputs.name }} \
-            --file ${{ inputs.dockerfile }} \
+            --file "$DOCKERFILE_PATH" \
             --push \
             --cache-from type=registry,ref=${CACHE_REF} \
             --cache-to   type=registry,ref=${CACHE_REF},mode=max \
@@ -273,7 +283,7 @@ jobs:
             --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
             $EXTRA_BUILD_ARGS \
             --tag "$PUSH_TAG" \
-            ${{ inputs.context }} \
+            "$BUILD_CONTEXT" \
             --metadata-file /tmp/build-metadata.json
 
           # Extract digest from build metadata
@@ -339,6 +349,8 @@ jobs:
 
       - name: Runtime Import Validation
         if: ${{ inputs.runtime_import != '' }}
+        env:
+          RUNTIME_IMPORT_EXPR: ${{ inputs.runtime_import }}
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ inputs.image_name }}"
@@ -347,9 +359,8 @@ jobs:
           FULL_IMAGE="${LOCAL_REG}/${IMAGE_NAME}:${IMMUTABLE_TAG}"
 
           echo "Running import check in: $FULL_IMAGE"
-          docker run --rm "$FULL_IMAGE" python -c "
-          ${{ inputs.runtime_import }}
-          "
+          # Pass import expression via stdin to avoid shell injection
+          printf '%s' "$RUNTIME_IMPORT_EXPR" | docker run --rm -i "$FULL_IMAGE" python -c "$(cat)"
           echo "PASS: runtime import validation succeeded"
 
       # ─── OCI provenance verification ──────────────────────────────────────
@@ -446,7 +457,11 @@ jobs:
           LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
 
           # Compute Dockerfile SHA-256
-          DOCKERFILE_SHA=$(sha256sum "${{ inputs.dockerfile }}" | awk '{print $1}')
+          DOCKERFILE_SHA=$(sha256sum "${{ inputs.dockerfile }}" 2>/dev/null | awk '{print $1}')
+          if [ -z "$DOCKERFILE_SHA" ]; then
+            echo "::warning::Could not compute Dockerfile SHA-256 (file may not exist in checkout)"
+            DOCKERFILE_SHA="unknown"
+          fi
 
           cat > /tmp/image-provenance.json <<EOF
           {

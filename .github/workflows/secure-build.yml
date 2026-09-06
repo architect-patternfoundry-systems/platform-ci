@@ -68,8 +68,6 @@ jobs:
     runs-on: self-hosted
     permissions:
       contents: read
-      id-token: write
-      attestations: write
     outputs:
       image_digest: ${{ steps.build-push.outputs.image_digest }}
       immutable_tag: ${{ steps.build-push.outputs.immutable_tag }}

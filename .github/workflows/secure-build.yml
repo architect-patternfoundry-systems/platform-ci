@@ -635,11 +635,11 @@ jobs:
           fi
 
           # Snapshot all container images before mutation
-          BEFORE_COUNT=$(yq ".spec.template.spec.containers | length" "$MANIFEST_PATH")
-          BEFORE_IMAGES=$(yq -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+          BEFORE_COUNT=$(yq eval ".spec.template.spec.containers | length" "$MANIFEST_PATH")
+          BEFORE_IMAGES=$(yq eval -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
 
           # Verify the target container exists and capture its current image
-          CURRENT_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
+          CURRENT_IMAGE=$(yq eval ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
           if [ -z "$CURRENT_IMAGE" ]; then
             echo "::error::Container '${CONTAINER_NAME}' not found in manifest"
             exit 1
@@ -655,33 +655,33 @@ jobs:
           fi
 
           # Update the image using yq (structured YAML mutation, not sed)
-          yq -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST_PATH"
+          yq eval -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST_PATH"
 
           # ─── Post-mutation verification ──────────────────────────────────
 
           # 1. Container count unchanged (no sidecar added/removed)
-          AFTER_COUNT=$(yq ".spec.template.spec.containers | length" "$MANIFEST_PATH")
+          AFTER_COUNT=$(yq eval ".spec.template.spec.containers | length" "$MANIFEST_PATH")
           if [ "$AFTER_COUNT" != "$BEFORE_COUNT" ]; then
             echo "::error::Container count changed: before=$BEFORE_COUNT after=$AFTER_COUNT"
             exit 1
           fi
 
           # 2. Exactly one container has the new image ref
-          MATCH_COUNT=$(yq ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH" | wc -l)
+          MATCH_COUNT=$(yq eval ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH" | wc -l)
           if [ "$MATCH_COUNT" -ne 1 ]; then
             echo "::error::Expected exactly 1 container with new image, found $MATCH_COUNT"
             exit 1
           fi
 
           # 3. The matching container is the expected one
-          MATCHED_NAME=$(yq ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH")
+          MATCHED_NAME=$(yq eval ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH")
           if [ "$MATCHED_NAME" != "$CONTAINER_NAME" ]; then
             echo "::error::Image was set on wrong container: expected=$CONTAINER_NAME actual=$MATCHED_NAME"
             exit 1
           fi
 
           # 4. Result image is digest-pinned (not tag-only, not :latest, not :main)
-          UPDATED_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
+          UPDATED_IMAGE=$(yq eval ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
           if [ "$UPDATED_IMAGE" != "$IMAGE_REF" ]; then
             echo "::error::Manifest update verification failed"
             echo "  Expected: $IMAGE_REF"
@@ -698,9 +698,9 @@ jobs:
           fi
 
           # 5. No other container images changed
-          AFTER_IMAGES=$(yq -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+          AFTER_IMAGES=$(yq eval -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
           # Compare all images except the target container
-          OTHER_BEFORE=$(yq -o=json "[.spec.template.spec.containers[] | select(.name != \"${CONTAINER_NAME}\") | .image]" "$MANIFEST_PATH")
+          OTHER_BEFORE=$(yq eval -o=json "[.spec.template.spec.containers[] | select(.name != \"${CONTAINER_NAME}\") | .image]" "$MANIFEST_PATH")
           # We already verified the target changed correctly; just verify count consistency
           OTHER_COUNT=$(echo "$OTHER_BEFORE" | jq length)
           if [ "$OTHER_COUNT" -ne $((BEFORE_COUNT - 1)) ]; then

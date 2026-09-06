@@ -1,0 +1,13 @@
+name: Test Minimal
+on:
+  workflow_call:
+    inputs:
+      test_input:
+        type: string
+        required: false
+        default: "hello"
+jobs:
+  test:
+    runs-on: self-hosted
+    steps:
+      - run: echo "${{ inputs.test_input }}"

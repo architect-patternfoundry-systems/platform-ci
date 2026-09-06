@@ -68,13 +68,15 @@ jobs:
   build-and-verify:
     runs-on: self-hosted
     permissions:
-      contents: write
+      contents: read
       id-token: write
       attestations: write
     outputs:
       image_digest: ${{ steps.build-push.outputs.image_digest }}
       immutable_tag: ${{ steps.build-push.outputs.immutable_tag }}
       logical_image_ref: ${{ steps.build-push.outputs.logical_image_ref }}
+      registry_resolved_digest: ${{ steps.verify-post-push.outputs.registry_digest }}
+      logical_registry: ${{ steps.resolve_registry.outputs.logical }}
     steps:
       # ─── Trust validation ────────────────────────────────────────────────
 
@@ -103,7 +105,7 @@ jobs:
       # ─── Checkout ────────────────────────────────────────────────────────
 
       - name: Checkout caller repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           clean: true
           fetch-depth: 0
@@ -161,7 +163,7 @@ jobs:
 
       - name: Set up Docker Buildx
         id: buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
           driver: docker-container
           driver-opts: network=host
@@ -210,7 +212,7 @@ jobs:
           IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
           LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
 
-          # Check if tag already exists (it should not for a new build)
+          # Check if tag already exists — fail closed if it has a different digest
           if curl --fail --silent --head \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
               "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" > /dev/null 2>&1; then
@@ -222,6 +224,7 @@ jobs:
             )"
             echo "::warning::Tag ${IMMUTABLE_TAG} already exists with digest ${EXISTING_DIGEST}"
             echo "existing_digest=${EXISTING_DIGEST}" >> $GITHUB_OUTPUT
+            # Tag exists — will verify post-push that digest is unchanged
           else
             echo "Tag ${IMMUTABLE_TAG} does not exist — new build"
             echo "existing_digest=" >> $GITHUB_OUTPUT
@@ -284,12 +287,13 @@ jobs:
           echo "immutable_tag=$IMMUTABLE_TAG" >> $GITHUB_OUTPUT
           echo "logical_image_ref=${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
 
-          echo "Image digest: $IMAGE_DIGEST"
+          echo "Image digest (build metadata): $IMAGE_DIGEST"
           echo "Logical ref:  ${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}"
 
       # ─── Post-push immutability verification ──────────────────────────────
 
       - name: Verify Tag Immutability (Post-push)
+        id: verify-post-push
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ inputs.image_name }}"
@@ -297,6 +301,8 @@ jobs:
           LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
           BUILD_DIGEST="${{ steps.build-push.outputs.image_digest }}"
 
+          # Resolve the actual registry digest — this is the source of truth
+          # for manifest mutation, not the local build metadata digest.
           REGISTRY_DIGEST="$(
             curl --fail --silent --show-error --head \
               -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
@@ -304,6 +310,14 @@ jobs:
               awk -F': ' 'tolower($1) == "docker-content-digest" {gsub("\r", "", $2); print $2}'
           )"
 
+          if [ -z "$REGISTRY_DIGEST" ]; then
+            echo "::error::Could not resolve registry digest for ${IMMUTABLE_TAG}"
+            exit 1
+          fi
+
+          echo "registry_digest=${REGISTRY_DIGEST}" >> $GITHUB_OUTPUT
+
+          # Verify registry digest matches build metadata
           if [ "$REGISTRY_DIGEST" != "$BUILD_DIGEST" ]; then
             echo "::error::Digest mismatch: build metadata=$BUILD_DIGEST, registry=$REGISTRY_DIGEST"
             exit 1
@@ -311,12 +325,15 @@ jobs:
 
           echo "PASS: registry digest matches build metadata ($REGISTRY_DIGEST)"
 
-          # Check pre-existing tag was not overwritten
+          # Check pre-existing tag was not overwritten with different content
           EXISTING="${{ steps.immutability_pre.outputs.existing_digest }}"
           if [ -n "$EXISTING" ] && [ "$EXISTING" != "$REGISTRY_DIGEST" ]; then
             echo "::error::Tag immutability violation: ${IMMUTABLE_TAG} was ${EXISTING}, now ${REGISTRY_DIGEST}"
+            echo "::error::Timestamp/Git-SHA tags must be immutable. Use a different tag or rebuild with same content."
             exit 1
           fi
+
+          echo "PASS: tag immutability verified"
 
       # ─── Runtime import validation ────────────────────────────────────────
 
@@ -349,20 +366,18 @@ jobs:
           EXPECTED_SHORT_SHA="${EXPECTED_SHA:0:7}"
           EXPECTED_SOURCE="${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }}"
 
-          # Resolve config blob
-          INDEX_DIGEST="$(
-            curl --fail --silent --show-error --head \
-              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
-              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
-              awk -F': ' 'tolower($1) == "docker-content-digest" {gsub("\r", "", $2); print $2}'
-          )"
-
+          # Resolve config blob via registry (source of truth, not local assumption)
           AMD64_DIGEST="$(
             curl --fail --silent \
               -H 'Accept: application/vnd.oci.image.index.v1+json' \
               "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
               jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest'
           )"
+
+          if [ -z "$AMD64_DIGEST" ]; then
+            echo "::error::No linux/amd64 platform manifest found"
+            exit 1
+          fi
 
           CONFIG_DIGEST="$(
             curl --fail --silent \
@@ -426,7 +441,7 @@ jobs:
           set -euo pipefail
           IMAGE_NAME="${{ inputs.image_name }}"
           IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
-          IMAGE_DIGEST="${{ steps.build-push.outputs.image_digest }}"
+          IMAGE_DIGEST="${{ steps.verify-post-push.outputs.registry_digest }}"
           LOGICAL_REG="${{ steps.resolve_registry.outputs.logical }}"
           LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
 
@@ -456,29 +471,56 @@ jobs:
           echo "=== Provenance Artifact ==="
           cat /tmp/image-provenance.json | jq .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: image-provenance-${{ inputs.image_name }}
           path: /tmp/image-provenance.json
           retention-days: 90
 
-      # ─── Manifest mutation (optional, guarded) ────────────────────────────
+  # ─── Manifest mutation (separate job for serialization) ──────────────────
+  #
+  # This job is separated from build-and-verify so that:
+  # 1. Build jobs can run concurrently without racing on manifest writes.
+  # 2. Manifest mutation is serialized per target manifest via concurrency.
+  # 3. The mutation job only runs after build verification passes.
+  # 4. Permissions are scoped: contents: write is only on this job.
 
-      - name: Update Deployment Manifest
-        if: ${{ inputs.mutate_manifest && inputs.deployment_manifest != '' && inputs.deploy_container_name != '' }}
+  mutate-manifest:
+    runs-on: self-hosted
+    needs: build-and-verify
+    if: ${{ inputs.mutate_manifest && inputs.deployment_manifest != '' && inputs.deploy_container_name != '' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Validate trusted ref (manifest mutation)
         run: |
           set -euo pipefail
-
           if [ "${{ github.ref }}" != "refs/heads/main" ]; then
             echo "::error::Manifest mutation is only allowed on main. Ref: ${{ github.ref }}"
             exit 1
           fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "::error::Manifest mutation must not run on pull_request events."
+            exit 1
+          fi
+          echo "PASS: trusted ref for manifest mutation"
+
+      - name: Checkout caller repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: true
+          fetch-depth: 0
+          set-safe-directory: true
+
+      - name: Update Deployment Manifest
+        run: |
+          set -euo pipefail
 
           MANIFEST="${{ inputs.deployment_manifest }}"
           CONTAINER_NAME="${{ inputs.deploy_container_name }}"
           IMAGE_NAME="${{ inputs.image_name }}"
-          IMAGE_DIGEST="${{ steps.build-push.outputs.image_digest }}"
-          LOGICAL_REG="${{ steps.resolve_registry.outputs.logical }}"
+          IMAGE_DIGEST="${{ needs.build-and-verify.outputs.registry_resolved_digest }}"
+          LOGICAL_REG="${{ needs.build-and-verify.outputs.logical_registry }}"
           IMAGE_REF="${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}"
 
           echo "Updating $MANIFEST — container: $CONTAINER_NAME"
@@ -512,7 +554,7 @@ jobs:
           # Update the image using yq (structured YAML mutation, not sed)
           yq -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST"
 
-          # Verify the update
+          # Verify the update — parse and assert exact match
           UPDATED_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST")
           if [ "$UPDATED_IMAGE" != "$IMAGE_REF" ]; then
             echo "::error::Manifest update verification failed"
@@ -523,16 +565,16 @@ jobs:
 
           echo "PASS: manifest updated and verified"
 
-          # Commit the change
+          # Commit the change with full provenance in the message
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add "$MANIFEST"
 
           COMMIT_MSG="chore(deploy): pin ${IMAGE_NAME} to ${IMAGE_DIGEST}
 
-          Immutable tag: ${{ steps.gen_tag.outputs.immutable_tag }}
+          Immutable tag: ${{ needs.build-and-verify.outputs.immutable_tag }}
           Source commit: ${{ github.sha }}
-          Provenance: verified (OCI labels, digest, platform)
+          Provenance: verified (OCI labels, digest, platform, immutability)
 
           Generated by platform-ci secure-build.yml"
 

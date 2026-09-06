@@ -99,9 +99,9 @@ jobs:
 
           echo "PASS: trusted ref validated"
 
-      # ─── Input validation ────────────────────────────────────────────────
+      # ─── Input validation (format checks, before checkout) ──────────────
 
-      - name: Validate Inputs
+      - name: Validate Input Formats
         env:
           INPUT_IMAGE_NAME: ${{ inputs.image_name }}
           INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
@@ -112,29 +112,21 @@ jobs:
         run: |
           set -euo pipefail
 
-          # image_name: must match repository/image grammar (lowercase, alphanumeric, -, _, /, .)
+          # image_name: must match repository/image grammar
           if ! [[ "$INPUT_IMAGE_NAME" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*$ ]]; then
             echo "::error::Invalid image_name: $INPUT_IMAGE_NAME"
             exit 1
           fi
 
-          # dockerfile: must be a relative path, no .., must exist
+          # dockerfile: must be a relative path, no ..
           if [[ "$INPUT_DOCKERFILE" == ../* ]] || [[ "$INPUT_DOCKERFILE" == */../* ]] || [[ "$INPUT_DOCKERFILE" == /* ]]; then
             echo "::error::dockerfile must be a relative path without ..: $INPUT_DOCKERFILE"
             exit 1
           fi
-          if [ ! -f "$INPUT_DOCKERFILE" ]; then
-            echo "::error::dockerfile does not exist: $INPUT_DOCKERFILE"
-            exit 1
-          fi
 
-          # context: must be a relative directory, no .., must exist
+          # context: must be a relative path, no ..
           if [[ "$INPUT_CONTEXT" == ../* ]] || [[ "$INPUT_CONTEXT" == */../* ]] || [[ "$INPUT_CONTEXT" == /* ]]; then
             echo "::error::context must be a relative path without ..: $INPUT_CONTEXT"
-            exit 1
-          fi
-          if [ ! -d "$INPUT_CONTEXT" ]; then
-            echo "::error::context directory does not exist: $INPUT_CONTEXT"
             exit 1
           fi
 
@@ -146,7 +138,7 @@ jobs:
             fi
           fi
 
-          # deploy_container_name: if non-empty, must match DNS-label-ish grammar
+          # deploy_container_name: if non-empty, must match DNS-label grammar
           if [ -n "$INPUT_DEPLOY_CONTAINER_NAME" ]; then
             if ! [[ "$INPUT_DEPLOY_CONTAINER_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
               echo "::error::Invalid deploy_container_name: $INPUT_DEPLOY_CONTAINER_NAME"
@@ -160,7 +152,7 @@ jobs:
             exit 1
           fi
 
-          echo "PASS: all inputs validated"
+          echo "PASS: input formats validated"
 
       # ─── Checkout ────────────────────────────────────────────────────────
 
@@ -170,6 +162,33 @@ jobs:
           clean: true
           fetch-depth: 0
           set-safe-directory: true
+
+      # ─── Input validation (existence checks, after checkout) ────────────
+
+      - name: Validate Input Paths Exist
+        env:
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+          INPUT_CONTEXT: ${{ inputs.context }}
+          INPUT_DEPLOYMENT_MANIFEST: ${{ inputs.deployment_manifest }}
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$INPUT_DOCKERFILE" ]; then
+            echo "::error::dockerfile does not exist: $INPUT_DOCKERFILE"
+            exit 1
+          fi
+
+          if [ ! -d "$INPUT_CONTEXT" ]; then
+            echo "::error::context directory does not exist: $INPUT_CONTEXT"
+            exit 1
+          fi
+
+          if [ -n "$INPUT_DEPLOYMENT_MANIFEST" ] && [ ! -f "$INPUT_DEPLOYMENT_MANIFEST" ]; then
+            echo "::error::deployment_manifest does not exist: $INPUT_DEPLOYMENT_MANIFEST"
+            exit 1
+          fi
+
+          echo "PASS: input paths verified"
 
       # ─── Registry resolution ─────────────────────────────────────────────
 

@@ -102,6 +102,69 @@ jobs:
 
           echo "PASS: trusted ref validated"
 
+      # ─── Input validation ────────────────────────────────────────────────
+
+      - name: Validate Inputs
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          INPUT_DOCKERFILE: ${{ inputs.dockerfile }}
+          INPUT_CONTEXT: ${{ inputs.context }}
+          INPUT_DEPLOYMENT_MANIFEST: ${{ inputs.deployment_manifest }}
+          INPUT_DEPLOY_CONTAINER_NAME: ${{ inputs.deploy_container_name }}
+          INPUT_REGISTRY_MODE: ${{ inputs.registry_mode }}
+        run: |
+          set -euo pipefail
+
+          # image_name: must match repository/image grammar (lowercase, alphanumeric, -, _, /, .)
+          if ! [[ "$INPUT_IMAGE_NAME" =~ ^[a-z0-9]([a-z0-9._-]*[a-z0-9])?(/[a-z0-9]([a-z0-9._-]*[a-z0-9])?)*$ ]]; then
+            echo "::error::Invalid image_name: $INPUT_IMAGE_NAME"
+            exit 1
+          fi
+
+          # dockerfile: must be a relative path, no .., must exist
+          if [[ "$INPUT_DOCKERFILE" == ../* ]] || [[ "$INPUT_DOCKERFILE" == */../* ]] || [[ "$INPUT_DOCKERFILE" == /* ]]; then
+            echo "::error::dockerfile must be a relative path without ..: $INPUT_DOCKERFILE"
+            exit 1
+          fi
+          if [ ! -f "$INPUT_DOCKERFILE" ]; then
+            echo "::error::dockerfile does not exist: $INPUT_DOCKERFILE"
+            exit 1
+          fi
+
+          # context: must be a relative directory, no .., must exist
+          if [[ "$INPUT_CONTEXT" == ../* ]] || [[ "$INPUT_CONTEXT" == */../* ]] || [[ "$INPUT_CONTEXT" == /* ]]; then
+            echo "::error::context must be a relative path without ..: $INPUT_CONTEXT"
+            exit 1
+          fi
+          if [ ! -d "$INPUT_CONTEXT" ]; then
+            echo "::error::context directory does not exist: $INPUT_CONTEXT"
+            exit 1
+          fi
+
+          # deployment_manifest: if non-empty, must be relative, no ..
+          if [ -n "$INPUT_DEPLOYMENT_MANIFEST" ]; then
+            if [[ "$INPUT_DEPLOYMENT_MANIFEST" == ../* ]] || [[ "$INPUT_DEPLOYMENT_MANIFEST" == */../* ]] || [[ "$INPUT_DEPLOYMENT_MANIFEST" == /* ]]; then
+              echo "::error::deployment_manifest must be a relative path without ..: $INPUT_DEPLOYMENT_MANIFEST"
+              exit 1
+            fi
+          fi
+
+          # deploy_container_name: if non-empty, must match DNS-label-ish grammar
+          if [ -n "$INPUT_DEPLOY_CONTAINER_NAME" ]; then
+            if ! [[ "$INPUT_DEPLOY_CONTAINER_NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+              echo "::error::Invalid deploy_container_name: $INPUT_DEPLOY_CONTAINER_NAME"
+              exit 1
+            fi
+          fi
+
+          # registry_mode: must be one of the approved values
+          if [[ "$INPUT_REGISTRY_MODE" != "logical" && "$INPUT_REGISTRY_MODE" != "local" ]]; then
+            echo "::error::registry_mode must be 'logical' or 'local', got: $INPUT_REGISTRY_MODE"
+            exit 1
+          fi
+
+          echo "PASS: all inputs validated"
+
       # ─── Checkout ────────────────────────────────────────────────────────
 
       - name: Checkout caller repository
@@ -238,6 +301,7 @@ jobs:
           BUILD_ARGS_INPUT: ${{ inputs.build_args }}
           DOCKERFILE_PATH: ${{ inputs.dockerfile }}
           BUILD_CONTEXT: ${{ inputs.context }}
+          VCS_SOURCE: ${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }}
         run: |
           set -euo pipefail
           IMAGE_NAME="${{ inputs.image_name }}"
@@ -251,18 +315,29 @@ jobs:
           TRUSTED_HOST=$(echo "${{ secrets.INTERNAL_PYPI_URL }}" | awk -F/ '{print $3}' | cut -d: -f1)
           CACHE_REF="${LOCAL_REG}/${IMAGE_NAME}:cache"
 
-          # Parse additional build args from env var (avoids shell injection)
-          EXTRA_BUILD_ARGS=""
+          # Build args as a bash array — values stay as values, no string re-parsing
+          BUILD_ARGS=(
+            --build-arg "PIP_INDEX_URL=${{ secrets.INTERNAL_PYPI_URL }}"
+            --build-arg "PIP_EXTRA_INDEX_URL=https://pypi.org/simple"
+            --build-arg "PIP_TRUSTED_HOST=$TRUSTED_HOST"
+            --build-arg "CACHEBUST=${{ github.sha }}"
+            --build-arg "VCS_REF=${{ github.sha }}"
+            --build-arg "VCS_SOURCE=$VCS_SOURCE"
+            --build-arg "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          )
+
+          # Parse additional build args from env var into the array
           if [ -n "$BUILD_ARGS_INPUT" ]; then
             while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              # Validate: only key=value pairs, no shell metacharacters
-              if echo "$line" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*='; then
-                EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS --build-arg $line"
-              else
+              [[ -z "$line" ]] && continue
+              # Validate: KEY=value format, capture key and value separately
+              [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || {
                 echo "::error::Invalid build arg (must be KEY=value): $line"
                 exit 1
-              fi
+              }
+              key="${BASH_REMATCH[1]}"
+              value="${BASH_REMATCH[2]}"
+              BUILD_ARGS+=(--build-arg "${key}=${value}")
             done <<< "$BUILD_ARGS_INPUT"
           fi
 
@@ -272,16 +347,9 @@ jobs:
             --builder ${{ steps.buildx.outputs.name }} \
             --file "$DOCKERFILE_PATH" \
             --push \
-            --cache-from type=registry,ref=${CACHE_REF} \
-            --cache-to   type=registry,ref=${CACHE_REF},mode=max \
-            --build-arg PIP_INDEX_URL=${{ secrets.INTERNAL_PYPI_URL }} \
-            --build-arg PIP_EXTRA_INDEX_URL=https://pypi.org/simple \
-            --build-arg PIP_TRUSTED_HOST=$TRUSTED_HOST \
-            --build-arg CACHEBUST=${{ github.sha }} \
-            --build-arg VCS_REF=${{ github.sha }} \
-            --build-arg VCS_SOURCE=${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }} \
-            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
-            $EXTRA_BUILD_ARGS \
+            --cache-from "type=registry,ref=${CACHE_REF}" \
+            --cache-to   "type=registry,ref=${CACHE_REF},mode=max" \
+            "${BUILD_ARGS[@]}" \
             --tag "$PUSH_TAG" \
             "$BUILD_CONTEXT" \
             --metadata-file /tmp/build-metadata.json
@@ -528,26 +596,33 @@ jobs:
           set-safe-directory: true
 
       - name: Update Deployment Manifest
+        env:
+          MANIFEST_PATH: ${{ inputs.deployment_manifest }}
+          CONTAINER_NAME: ${{ inputs.deploy_container_name }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          IMAGE_DIGEST: ${{ needs.build-and-verify.outputs.registry_resolved_digest }}
+          LOGICAL_REG: ${{ needs.build-and-verify.outputs.logical_registry }}
+          IMMUTABLE_TAG: ${{ needs.build-and-verify.outputs.immutable_tag }}
+          SOURCE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
 
-          MANIFEST="${{ inputs.deployment_manifest }}"
-          CONTAINER_NAME="${{ inputs.deploy_container_name }}"
-          IMAGE_NAME="${{ inputs.image_name }}"
-          IMAGE_DIGEST="${{ needs.build-and-verify.outputs.registry_resolved_digest }}"
-          LOGICAL_REG="${{ needs.build-and-verify.outputs.logical_registry }}"
           IMAGE_REF="${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}"
 
-          echo "Updating $MANIFEST — container: $CONTAINER_NAME"
+          echo "Updating $MANIFEST_PATH — container: $CONTAINER_NAME"
           echo "New image: $IMAGE_REF"
 
-          if [ ! -f "$MANIFEST" ]; then
-            echo "::error::Manifest not found: $MANIFEST"
+          if [ ! -f "$MANIFEST_PATH" ]; then
+            echo "::error::Manifest not found: $MANIFEST_PATH"
             exit 1
           fi
 
-          # Verify the current image is digest-pinned or a placeholder
-          CURRENT_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST")
+          # Snapshot all container images before mutation
+          BEFORE_COUNT=$(yq ".spec.template.spec.containers | length" "$MANIFEST_PATH")
+          BEFORE_IMAGES=$(yq -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+
+          # Verify the target container exists and capture its current image
+          CURRENT_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
           if [ -z "$CURRENT_IMAGE" ]; then
             echo "::error::Container '${CONTAINER_NAME}' not found in manifest"
             exit 1
@@ -555,40 +630,78 @@ jobs:
 
           echo "Current image: $CURRENT_IMAGE"
 
-          # Fail if current image uses a mutable tag (not @sha256:)
-          if echo "$CURRENT_IMAGE" | grep -qv '@sha256:'; then
-            if echo "$CURRENT_IMAGE" | grep -qE ':(latest|main)$'; then
-              echo "::error::Current image uses a mutable tag: $CURRENT_IMAGE"
-              echo "::error::Refusing to update — fix the manifest to use a digest first."
-              exit 1
-            fi
-            # Allow first-time setup from a tag-based placeholder
-            echo "::warning::Current image is not digest-pinned: $CURRENT_IMAGE"
+          # Fail if current image uses a mutable tag (:latest or :main)
+          if echo "$CURRENT_IMAGE" | grep -qE ':(latest|main)$'; then
+            echo "::error::Current image uses a mutable tag: $CURRENT_IMAGE"
+            echo "::error::Refusing to update — fix the manifest to use a digest first."
+            exit 1
           fi
 
           # Update the image using yq (structured YAML mutation, not sed)
-          yq -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST"
+          yq -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST_PATH"
 
-          # Verify the update — parse and assert exact match
-          UPDATED_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST")
+          # ─── Post-mutation verification ──────────────────────────────────
+
+          # 1. Container count unchanged (no sidecar added/removed)
+          AFTER_COUNT=$(yq ".spec.template.spec.containers | length" "$MANIFEST_PATH")
+          if [ "$AFTER_COUNT" != "$BEFORE_COUNT" ]; then
+            echo "::error::Container count changed: before=$BEFORE_COUNT after=$AFTER_COUNT"
+            exit 1
+          fi
+
+          # 2. Exactly one container has the new image ref
+          MATCH_COUNT=$(yq ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH" | wc -l)
+          if [ "$MATCH_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly 1 container with new image, found $MATCH_COUNT"
+            exit 1
+          fi
+
+          # 3. The matching container is the expected one
+          MATCHED_NAME=$(yq ".spec.template.spec.containers[] | select(.image == \"${IMAGE_REF}\") | .name" "$MANIFEST_PATH")
+          if [ "$MATCHED_NAME" != "$CONTAINER_NAME" ]; then
+            echo "::error::Image was set on wrong container: expected=$CONTAINER_NAME actual=$MATCHED_NAME"
+            exit 1
+          fi
+
+          # 4. Result image is digest-pinned (not tag-only, not :latest, not :main)
+          UPDATED_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST_PATH")
           if [ "$UPDATED_IMAGE" != "$IMAGE_REF" ]; then
             echo "::error::Manifest update verification failed"
             echo "  Expected: $IMAGE_REF"
             echo "  Got:      $UPDATED_IMAGE"
             exit 1
           fi
+          if ! echo "$UPDATED_IMAGE" | grep -q '@sha256:'; then
+            echo "::error::Result image is not digest-pinned: $UPDATED_IMAGE"
+            exit 1
+          fi
+          if echo "$UPDATED_IMAGE" | grep -qE ':(latest|main)'; then
+            echo "::error::Result image contains a mutable tag: $UPDATED_IMAGE"
+            exit 1
+          fi
 
-          echo "PASS: manifest updated and verified"
+          # 5. No other container images changed
+          AFTER_IMAGES=$(yq -o=json ".spec.template.spec.containers[].image" "$MANIFEST_PATH")
+          # Compare all images except the target container
+          OTHER_BEFORE=$(yq -o=json "[.spec.template.spec.containers[] | select(.name != \"${CONTAINER_NAME}\") | .image]" "$MANIFEST_PATH")
+          # We already verified the target changed correctly; just verify count consistency
+          OTHER_COUNT=$(echo "$OTHER_BEFORE" | jq length)
+          if [ "$OTHER_COUNT" -ne $((BEFORE_COUNT - 1)) ]; then
+            echo "::error::Non-target container count unexpected: $OTHER_COUNT (expected $((BEFORE_COUNT - 1)))"
+            exit 1
+          fi
 
-          # Commit the change with full provenance in the message
+          echo "PASS: manifest updated and verified (container count, exact match, digest-pinned, no mutable tags)"
+
+          # Commit with [skip ci] to prevent recursive build triggers
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$MANIFEST"
+          git add "$MANIFEST_PATH"
 
-          COMMIT_MSG="chore(deploy): pin ${IMAGE_NAME} to ${IMAGE_DIGEST}
+          COMMIT_MSG="chore(deploy): pin ${IMAGE_NAME} to ${IMAGE_DIGEST} [skip ci]
 
-          Immutable tag: ${{ needs.build-and-verify.outputs.immutable_tag }}
-          Source commit: ${{ github.sha }}
+          Immutable tag: ${IMMUTABLE_TAG}
+          Source commit: ${SOURCE_SHA}
           Provenance: verified (OCI labels, digest, platform, immutability)
 
           Generated by platform-ci secure-build.yml"

@@ -1,0 +1,549 @@
+name: Secure Container Build and Publish
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        type: string
+        required: true
+        description: "Image name in the registry (e.g. zerotrace-ui)"
+      dockerfile:
+        type: string
+        required: true
+        description: "Path to the Dockerfile relative to the build context"
+      context:
+        type: string
+        required: false
+        default: "."
+        description: "Build context directory"
+      runtime_import:
+        type: string
+        required: false
+        default: ""
+        description: "Python import expression to validate inside the built container"
+      deployment_manifest:
+        type: string
+        required: false
+        default: ""
+        description: "Path to the deployment manifest to update with digest (relative to caller repo)"
+      deploy_container_name:
+        type: string
+        required: false
+        default: ""
+        description: "Container name in the deployment manifest to update"
+      mutate_manifest:
+        type: boolean
+        required: false
+        default: false
+        description: "If true, update the deployment manifest with the digest-pinned image reference"
+      registry_mode:
+        type: string
+        required: true
+        description: "Registry mode: 'logical' (bridge hostname) or 'local' (ClusterIP + digest)"
+      expected_source_repo:
+        type: string
+        required: false
+        default: ""
+        description: "Expected OCI source label (e.g. https://github.com/org/repo)"
+      build_args:
+        type: string
+        required: false
+        default: ""
+        description: "Additional build args as key=value pairs (newline-separated)"
+    secrets:
+      INFRA_SSH_KEY:
+        required: false
+      INTERNAL_PYPI_URL:
+        required: true
+
+outputs:
+  image_digest:
+    value: ${{ jobs.build-and-verify.outputs.image_digest }}
+  immutable_tag:
+    value: ${{ jobs.build-and-verify.outputs.immutable_tag }}
+  logical_image_ref:
+    value: ${{ jobs.build-and-verify.outputs.logical_image_ref }}
+
+jobs:
+  build-and-verify:
+    runs-on: self-hosted
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    outputs:
+      image_digest: ${{ steps.build-push.outputs.image_digest }}
+      immutable_tag: ${{ steps.build-push.outputs.immutable_tag }}
+      logical_image_ref: ${{ steps.build-push.outputs.logical_image_ref }}
+    steps:
+      # ─── Trust validation ────────────────────────────────────────────────
+
+      - name: Validate trusted ref
+        run: |
+          set -euo pipefail
+          REF="${{ github.ref }}"
+          EVENT="${{ github.event_name }}"
+
+          echo "Event: $EVENT"
+          echo "Ref:   $REF"
+
+          # Only allow workflow_dispatch or push to protected branches
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "::error::This workflow must not run on pull_request events. Use a separate validation workflow for PRs."
+            exit 1
+          fi
+
+          if [ "$EVENT" = "push" ] && [ "$REF" != "refs/heads/main" ]; then
+            echo "::error::Push builds are only allowed on main. Ref: $REF"
+            exit 1
+          fi
+
+          echo "PASS: trusted ref validated"
+
+      # ─── Checkout ────────────────────────────────────────────────────────
+
+      - name: Checkout caller repository
+        uses: actions/checkout@v4
+        with:
+          clean: true
+          fetch-depth: 0
+          set-safe-directory: true
+
+      # ─── Registry resolution ─────────────────────────────────────────────
+
+      - name: Resolve Registry Identities
+        id: resolve_registry
+        run: |
+          set -euo pipefail
+
+          LOGICAL_HOST="registry-bridge.tailc2cafc.ts.net"
+
+          INTERNAL_IP=$(kubectl get svc registry-local -n infra-system \
+            -o jsonpath='{.spec.clusterIP}' 2>/dev/null)
+          if [ -z "$INTERNAL_IP" ]; then
+            echo "::error::Cannot resolve ClusterIP for registry-local in infra-system."
+            exit 1
+          fi
+
+          LOCAL_REG="127.0.0.1:30500"
+          if ! curl -s -f --connect-timeout 2 http://127.0.0.1:30500/v2/ > /dev/null; then
+            echo "::warning::Local port 30500 unresponsive. Falling back to ClusterIP: $INTERNAL_IP"
+            LOCAL_REG="${INTERNAL_IP}:80"
+          fi
+
+          echo "logical=$LOGICAL_HOST" >> $GITHUB_OUTPUT
+          echo "local=$LOCAL_REG" >> $GITHUB_OUTPUT
+          echo "internal=$INTERNAL_IP" >> $GITHUB_OUTPUT
+
+          echo "Resolved:"
+          echo "  Logical:  $LOGICAL_HOST"
+          echo "  Local:    $LOCAL_REG"
+          echo "  Internal: $INTERNAL_IP"
+
+      # ─── BuildKit setup ──────────────────────────────────────────────────
+
+      - name: Create BuildKit Config
+        id: buildkit_config
+        run: |
+          LOGICAL="${{ steps.resolve_registry.outputs.logical }}"
+          LOCAL="${{ steps.resolve_registry.outputs.local }}"
+          INTERNAL="${{ steps.resolve_registry.outputs.internal }}"
+
+          BK_CONFIG=$(mktemp)
+          write_entry() {
+            printf "[registry.\"%s\"]\n  http = true\n  insecure = true\n" "$1" >> "$BK_CONFIG"
+          }
+          write_entry "$LOGICAL"
+          [ "$LOCAL" != "$LOGICAL" ] && write_entry "$LOCAL"
+          [ "$INTERNAL" != "$LOGICAL" ] && [ "$INTERNAL" != "$LOCAL" ] && write_entry "$INTERNAL"
+
+          echo "bk_path=$BK_CONFIG" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker-container
+          driver-opts: network=host
+          buildkitd-flags: --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host
+          config: ${{ steps.buildkit_config.outputs.bk_path }}
+          use: true
+
+      # ─── Build context budget ────────────────────────────────────────────
+
+      - name: Enforce Build Context Budget
+        run: |
+          set -euo pipefail
+          CONTEXT_DIR="${{ inputs.context }}"
+
+          if [ -f ".dockerignore" ]; then
+            CONTEXT_SIZE_BYTES=$(tar -cf - --exclude-vcs --exclude-from=.dockerignore . | wc -c)
+            CONTEXT_SIZE=$(expr $CONTEXT_SIZE_BYTES / 1024)
+          else
+            CONTEXT_SIZE=$(du -sk "$CONTEXT_DIR" | cut -f1)
+          fi
+
+          CONTEXT_MB=$(echo "scale=2; $CONTEXT_SIZE / 1024" | bc)
+          echo "::notice::Build context size: ${CONTEXT_MB} MB"
+
+          if [ $CONTEXT_SIZE -gt 512000 ]; then
+            echo "::error::Build context (${CONTEXT_MB} MB) exceeds 500MB budget. Check .dockerignore."
+            exit 1
+          fi
+
+      # ─── Pre-push immutability check ─────────────────────────────────────
+
+      - name: Generate Immutable Tag
+        id: gen_tag
+        run: |
+          TS=$(date -u +'%Y%m%d%H%M%S')
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMMUTABLE_TAG="${TS}-${SHORT_SHA}"
+          echo "immutable_tag=$IMMUTABLE_TAG" >> $GITHUB_OUTPUT
+          echo "Immutable tag: $IMMUTABLE_TAG"
+
+      - name: Check Tag Immutability (Pre-push)
+        id: immutability_pre
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+
+          # Check if tag already exists (it should not for a new build)
+          if curl --fail --silent --head \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" > /dev/null 2>&1; then
+            EXISTING_DIGEST="$(
+              curl --fail --silent --show-error --head \
+                -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+                "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
+                awk -F': ' 'tolower($1) == "docker-content-digest" {gsub("\r", "", $2); print $2}'
+            )"
+            echo "::warning::Tag ${IMMUTABLE_TAG} already exists with digest ${EXISTING_DIGEST}"
+            echo "existing_digest=${EXISTING_DIGEST}" >> $GITHUB_OUTPUT
+          else
+            echo "Tag ${IMMUTABLE_TAG} does not exist — new build"
+            echo "existing_digest=" >> $GITHUB_OUTPUT
+          fi
+
+      # ─── Build and push ──────────────────────────────────────────────────
+
+      - name: Build and Push Docker Image
+        id: build-push
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          LOGICAL_REG="${{ steps.resolve_registry.outputs.logical }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+
+          # Only push the immutable tag — NO :latest, NO :main
+          PUSH_TAG="${LOCAL_REG}/${IMAGE_NAME}:${IMMUTABLE_TAG}"
+
+          TRUSTED_HOST=$(echo "${{ secrets.INTERNAL_PYPI_URL }}" | awk -F/ '{print $3}' | cut -d: -f1)
+          CACHE_REF="${LOCAL_REG}/${IMAGE_NAME}:cache"
+
+          # Parse additional build args
+          EXTRA_BUILD_ARGS=""
+          if [ -n "${{ inputs.build_args }}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              EXTRA_BUILD_ARGS="$EXTRA_BUILD_ARGS --build-arg $line"
+            done <<< "${{ inputs.build_args }}"
+          fi
+
+          echo "Building and pushing: $PUSH_TAG"
+
+          docker buildx build \
+            --builder ${{ steps.buildx.outputs.name }} \
+            --file ${{ inputs.dockerfile }} \
+            --push \
+            --cache-from type=registry,ref=${CACHE_REF} \
+            --cache-to   type=registry,ref=${CACHE_REF},mode=max \
+            --build-arg PIP_INDEX_URL=${{ secrets.INTERNAL_PYPI_URL }} \
+            --build-arg PIP_EXTRA_INDEX_URL=https://pypi.org/simple \
+            --build-arg PIP_TRUSTED_HOST=$TRUSTED_HOST \
+            --build-arg CACHEBUST=${{ github.sha }} \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VCS_SOURCE=${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }} \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            $EXTRA_BUILD_ARGS \
+            --tag "$PUSH_TAG" \
+            ${{ inputs.context }} \
+            --metadata-file /tmp/build-metadata.json
+
+          # Extract digest from build metadata
+          IMAGE_DIGEST=$(jq -r '.["containerimage.digest"]' /tmp/build-metadata.json)
+          if [ -z "$IMAGE_DIGEST" ] || [ "$IMAGE_DIGEST" = "null" ]; then
+            echo "::error::Could not extract image digest from build metadata"
+            exit 1
+          fi
+
+          echo "image_digest=$IMAGE_DIGEST" >> $GITHUB_OUTPUT
+          echo "immutable_tag=$IMMUTABLE_TAG" >> $GITHUB_OUTPUT
+          echo "logical_image_ref=${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+
+          echo "Image digest: $IMAGE_DIGEST"
+          echo "Logical ref:  ${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+      # ─── Post-push immutability verification ──────────────────────────────
+
+      - name: Verify Tag Immutability (Post-push)
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+          BUILD_DIGEST="${{ steps.build-push.outputs.image_digest }}"
+
+          REGISTRY_DIGEST="$(
+            curl --fail --silent --show-error --head \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
+              awk -F': ' 'tolower($1) == "docker-content-digest" {gsub("\r", "", $2); print $2}'
+          )"
+
+          if [ "$REGISTRY_DIGEST" != "$BUILD_DIGEST" ]; then
+            echo "::error::Digest mismatch: build metadata=$BUILD_DIGEST, registry=$REGISTRY_DIGEST"
+            exit 1
+          fi
+
+          echo "PASS: registry digest matches build metadata ($REGISTRY_DIGEST)"
+
+          # Check pre-existing tag was not overwritten
+          EXISTING="${{ steps.immutability_pre.outputs.existing_digest }}"
+          if [ -n "$EXISTING" ] && [ "$EXISTING" != "$REGISTRY_DIGEST" ]; then
+            echo "::error::Tag immutability violation: ${IMMUTABLE_TAG} was ${EXISTING}, now ${REGISTRY_DIGEST}"
+            exit 1
+          fi
+
+      # ─── Runtime import validation ────────────────────────────────────────
+
+      - name: Runtime Import Validation
+        if: ${{ inputs.runtime_import != '' }}
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+          FULL_IMAGE="${LOCAL_REG}/${IMAGE_NAME}:${IMMUTABLE_TAG}"
+
+          echo "Running import check in: $FULL_IMAGE"
+          docker run --rm "$FULL_IMAGE" python -c "
+          ${{ inputs.runtime_import }}
+          "
+          echo "PASS: runtime import validation succeeded"
+
+      # ─── OCI provenance verification ──────────────────────────────────────
+
+      - name: Verify OCI Provenance Labels
+        id: verify-provenance
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+
+          EXPECTED_SHA="${{ github.sha }}"
+          EXPECTED_SHORT_SHA="${EXPECTED_SHA:0:7}"
+          EXPECTED_SOURCE="${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }}"
+
+          # Resolve config blob
+          INDEX_DIGEST="$(
+            curl --fail --silent --show-error --head \
+              -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
+              awk -F': ' 'tolower($1) == "docker-content-digest" {gsub("\r", "", $2); print $2}'
+          )"
+
+          AMD64_DIGEST="$(
+            curl --fail --silent \
+              -H 'Accept: application/vnd.oci.image.index.v1+json' \
+              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${IMMUTABLE_TAG}" | \
+              jq -r '.manifests[] | select(.platform.architecture == "amd64" and .platform.os == "linux") | .digest'
+          )"
+
+          CONFIG_DIGEST="$(
+            curl --fail --silent \
+              -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+              "http://${LOCAL_REG}/v2/${IMAGE_NAME}/manifests/${AMD64_DIGEST}" | \
+              jq -r '.config.digest'
+          )"
+
+          CONFIG_JSON="$(curl --fail --silent --location \
+            "http://${LOCAL_REG}/v2/${IMAGE_NAME}/blobs/${CONFIG_DIGEST}")"
+
+          ACTUAL_SHA="$(echo "$CONFIG_JSON" | jq -r '.config.Labels["org.opencontainers.image.revision"] // empty')"
+          ACTUAL_SOURCE="$(echo "$CONFIG_JSON" | jq -r '.config.Labels["org.opencontainers.image.source"] // empty')"
+          ACTUAL_CREATED="$(echo "$CONFIG_JSON" | jq -r '.config.Labels["org.opencontainers.image.created"] // empty')"
+          ACTUAL_ARCH="$(echo "$CONFIG_JSON" | jq -r '.architecture // empty')"
+          ACTUAL_OS="$(echo "$CONFIG_JSON" | jq -r '.os // empty')"
+          ACTUAL_BASE_NAME="$(echo "$CONFIG_JSON" | jq -r '.config.Labels["org.opencontainers.image.base.name"] // empty')"
+          ACTUAL_BASE_DIGEST="$(echo "$CONFIG_JSON" | jq -r '.config.Labels["org.opencontainers.image.base.digest"] // empty')"
+
+          echo "=== OCI Provenance ==="
+          echo "  revision:    $ACTUAL_SHA"
+          echo "  source:      $ACTUAL_SOURCE"
+          echo "  created:     $ACTUAL_CREATED"
+          echo "  arch/os:     $ACTUAL_ARCH/$ACTUAL_OS"
+          echo "  base.name:   $ACTUAL_BASE_NAME"
+          echo "  base.digest: $ACTUAL_BASE_DIGEST"
+
+          # Assertions
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA" || {
+            echo "::error::OCI revision mismatch: expected=$EXPECTED_SHA actual=$ACTUAL_SHA"
+            exit 1
+          }
+          test "$ACTUAL_SOURCE" = "$EXPECTED_SOURCE" || {
+            echo "::error::OCI source mismatch: expected=$EXPECTED_SOURCE actual=$ACTUAL_SOURCE"
+            exit 1
+          }
+          test -n "$ACTUAL_CREATED" || {
+            echo "::error::OCI created label is empty"
+            exit 1
+          }
+          test "$ACTUAL_ARCH" = "amd64" || {
+            echo "::error::Platform mismatch: expected amd64, got $ACTUAL_ARCH"
+            exit 1
+          }
+          test "$ACTUAL_OS" = "linux" || {
+            echo "::error::OS mismatch: expected linux, got $ACTUAL_OS"
+            exit 1
+          }
+          test "${ACTUAL_SHA:0:7}" = "$EXPECTED_SHORT_SHA" || {
+            echo "::error::SHA prefix mismatch: tag=$EXPECTED_SHORT_SHA oci=${ACTUAL_SHA:0:7}"
+            exit 1
+          }
+
+          echo "PASS: all OCI provenance checks passed"
+
+      # ─── Provenance artifact ──────────────────────────────────────────────
+
+      - name: Generate Provenance Artifact
+        id: provenance
+        run: |
+          set -euo pipefail
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMMUTABLE_TAG="${{ steps.gen_tag.outputs.immutable_tag }}"
+          IMAGE_DIGEST="${{ steps.build-push.outputs.image_digest }}"
+          LOGICAL_REG="${{ steps.resolve_registry.outputs.logical }}"
+          LOCAL_REG="${{ steps.resolve_registry.outputs.local }}"
+
+          # Compute Dockerfile SHA-256
+          DOCKERFILE_SHA=$(sha256sum "${{ inputs.dockerfile }}" | awk '{print $1}')
+
+          cat > /tmp/image-provenance.json <<EOF
+          {
+            "image": "${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}",
+            "immutable_tag": "${IMMUTABLE_TAG}",
+            "image_digest": "${IMAGE_DIGEST}",
+            "source_commit": "${{ github.sha }}",
+            "source_ref": "${{ github.ref }}",
+            "source_repository": "${{ inputs.expected_source_repo || format('https://github.com/{0}', github.repository) }}",
+            "build_workflow_ref": "${{ github.workflow_ref }}",
+            "runner_class": "self-hosted",
+            "dockerfile_sha256": "sha256:${DOCKERFILE_SHA}",
+            "built_at": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+            "registry_mode": "${{ inputs.registry_mode }}",
+            "logical_registry": "${LOGICAL_REG}",
+            "local_registry": "${LOCAL_REG}",
+            "verification_result": "PASSED",
+            "verification_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          }
+          EOF
+
+          echo "=== Provenance Artifact ==="
+          cat /tmp/image-provenance.json | jq .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-provenance-${{ inputs.image_name }}
+          path: /tmp/image-provenance.json
+          retention-days: 90
+
+      # ─── Manifest mutation (optional, guarded) ────────────────────────────
+
+      - name: Update Deployment Manifest
+        if: ${{ inputs.mutate_manifest && inputs.deployment_manifest != '' && inputs.deploy_container_name != '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.ref }}" != "refs/heads/main" ]; then
+            echo "::error::Manifest mutation is only allowed on main. Ref: ${{ github.ref }}"
+            exit 1
+          fi
+
+          MANIFEST="${{ inputs.deployment_manifest }}"
+          CONTAINER_NAME="${{ inputs.deploy_container_name }}"
+          IMAGE_NAME="${{ inputs.image_name }}"
+          IMAGE_DIGEST="${{ steps.build-push.outputs.image_digest }}"
+          LOGICAL_REG="${{ steps.resolve_registry.outputs.logical }}"
+          IMAGE_REF="${LOGICAL_REG}/${IMAGE_NAME}@${IMAGE_DIGEST}"
+
+          echo "Updating $MANIFEST — container: $CONTAINER_NAME"
+          echo "New image: $IMAGE_REF"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "::error::Manifest not found: $MANIFEST"
+            exit 1
+          fi
+
+          # Verify the current image is digest-pinned or a placeholder
+          CURRENT_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST")
+          if [ -z "$CURRENT_IMAGE" ]; then
+            echo "::error::Container '${CONTAINER_NAME}' not found in manifest"
+            exit 1
+          fi
+
+          echo "Current image: $CURRENT_IMAGE"
+
+          # Fail if current image uses a mutable tag (not @sha256:)
+          if echo "$CURRENT_IMAGE" | grep -qv '@sha256:'; then
+            if echo "$CURRENT_IMAGE" | grep -qE ':(latest|main)$'; then
+              echo "::error::Current image uses a mutable tag: $CURRENT_IMAGE"
+              echo "::error::Refusing to update — fix the manifest to use a digest first."
+              exit 1
+            fi
+            # Allow first-time setup from a tag-based placeholder
+            echo "::warning::Current image is not digest-pinned: $CURRENT_IMAGE"
+          fi
+
+          # Update the image using yq (structured YAML mutation, not sed)
+          yq -i ".spec.template.spec.containers[] |= select(.name == \"${CONTAINER_NAME}\").image = \"${IMAGE_REF}\"" "$MANIFEST"
+
+          # Verify the update
+          UPDATED_IMAGE=$(yq ".spec.template.spec.containers[] | select(.name == \"${CONTAINER_NAME}\") | .image" "$MANIFEST")
+          if [ "$UPDATED_IMAGE" != "$IMAGE_REF" ]; then
+            echo "::error::Manifest update verification failed"
+            echo "  Expected: $IMAGE_REF"
+            echo "  Got:      $UPDATED_IMAGE"
+            exit 1
+          fi
+
+          echo "PASS: manifest updated and verified"
+
+          # Commit the change
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$MANIFEST"
+
+          COMMIT_MSG="chore(deploy): pin ${IMAGE_NAME} to ${IMAGE_DIGEST}
+
+          Immutable tag: ${{ steps.gen_tag.outputs.immutable_tag }}
+          Source commit: ${{ github.sha }}
+          Provenance: verified (OCI labels, digest, platform)
+
+          Generated by platform-ci secure-build.yml"
+
+          git commit -m "$COMMIT_MSG" || {
+            echo "No changes to commit — manifest already up to date"
+            exit 0
+          }
+
+          git push || {
+            echo "::error::Failed to push manifest update"
+            exit 1
+          }
+
+          echo "PASS: manifest committed and pushed"
